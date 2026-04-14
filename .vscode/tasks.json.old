@@ -1,0 +1,53 @@
+{
+  "version": "0.1.0",
+  "tasks": [
+    {
+      "label": "Gemini: 测试 API 连接",
+      "type": "shell",
+      "command": "python",
+      "args": ["gemini_client.py", "test"],
+      "group": {
+        "kind": "none",
+        "isDefault": false
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Gemini: 分析当前脚本",
+      "type": "shell",
+      "command": "python",
+      "args": ["gemini_client.py", "analyze", "${file}"],
+      "group": {
+        "kind": "none",
+        "isDefault": false
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Gemini: 获取脚本改进建议",
+      "type": "shell",
+      "command": "python",
+      "args": ["gemini_client.py", "suggest", "${file}"],
+      "group": {
+        "kind": "none",
+        "isDefault": false
+      },
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared"
+      }
+    }
+  ]
+}

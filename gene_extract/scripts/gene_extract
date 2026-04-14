@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+生成时间: 2026-03-26
+脚本名称: gene_extract
+脚本作用:
+1. 读取多个 BSA plot.tsv 文件
+2. 按 |DELTA_SNP_INDEX| > 阈值 提取显著信号窗口
+3. 以每个显著窗口中心向上下游各延伸指定距离
+4. 从 GFF3 中提取落在这些区间内的候选基因
+
+输入文件:
+- 多个 *.plot.tsv
+- 基因组注释 GFF3
+
+输出文件:
+- gene_extract.significant_windows.tsv
+- gene_extract.sample_regions.tsv
+- gene_extract.window_genes.tsv
+- gene_extract.sample_candidate_genes.tsv
+- gene_extract.genes.bed
+- gene_extract.genes.tsv
+
+使用方法:
+python gene_extract \
+  --plot-tsv a.plot.tsv b.plot.tsv \
+  --gff3 Canz.genome.gff3 \
+  --output-dir ./output/gene_extract \
+  --delta-threshold 0.4 \
+  --flank 1000000
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Sequence, Tuple
+
+
+GENERATED_AT = "2026-03-26"
+SAMPLE_RE = re.compile(r"joint_(\d+)_")
+
+
+@dataclass
+class GeneRecord:
+    chrom: str
+    start: int
+    end: int
+    strand: str
+    gene_id: str
+    gene_id_base: str
+    gene_name: str
+    attributes: str
+
+
+@dataclass
+class WindowRecord:
+    sample: str
+    chrom: str
+    center: int
+    threshold: float
+    high_snp_index: float
+    low_snp_index: float
+    delta_snp_index: float
+    snp_n: int
+    sign: str
+    region_start: int
+    region_end: int
+    source_plot: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="从多个 BSA plot.tsv 中提取显著窗口，并从 GFF3 中提取候选基因。"
+    )
+    parser.add_argument("--plot-tsv", nargs="+", required=True, help="多个 BSA plot.tsv 文件路径")
+    parser.add_argument("--gff3", required=True, help="基因组 GFF3 注释文件")
+    parser.add_argument("--output-dir", required=True, help="输出目录")
+    parser.add_argument(
+        "--delta-threshold",
+        type=float,
+        default=0.4,
+        help="显著窗口阈值，按 |DELTA_SNP_INDEX| 判断",
+    )
+    parser.add_argument(
+        "--flank",
+        type=int,
+        default=1_000_000,
+        help="每个显著窗口中心向上下游延伸的距离，默认 1 Mb",
+    )
+    return parser.parse_args()
+
+
+def parse_attributes(attr_text: str) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for raw_field in attr_text.strip().strip(";").split(";"):
+        field = raw_field.strip()
+        if not field:
+            continue
+        if "=" in field:
+            key, value = field.split("=", 1)
+        elif " " in field:
+            key, value = field.split(" ", 1)
+            value = value.strip('"')
+        else:
+            continue
+        result[key.strip()] = value.strip()
+    return result
+
+
+def choose_gene_name(attr_map: Dict[str, str]) -> str:
+    for key in ("Name", "gene_name", "gene", "geneID", "locus_tag", "ID"):
+        value = attr_map.get(key)
+        if value:
+            return value
+    return "."
+
+
+def load_genes(gff3_path: str) -> List[GeneRecord]:
+    genes: List[GeneRecord] = []
+    with open(gff3_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 9:
+                continue
+            chrom, _, feature_type, start_s, end_s, _, strand, _, attr_text = parts
+            if feature_type != "gene":
+                continue
+            attr_map = parse_attributes(attr_text)
+            gene_id = attr_map.get("ID") or attr_map.get("gene_id") or choose_gene_name(attr_map)
+            gene_name = choose_gene_name(attr_map)
+            genes.append(
+                GeneRecord(
+                    chrom=chrom,
+                    start=int(start_s),
+                    end=int(end_s),
+                    strand=strand,
+                    gene_id=gene_id,
+                    gene_id_base=gene_id.split(".", 1)[0],
+                    gene_name=gene_name,
+                    attributes=attr_text,
+                )
+            )
+    genes.sort(key=lambda item: (item.chrom, item.start, item.end, item.gene_id))
+    return genes
+
+
+def infer_sample_name(path: str) -> str:
+    match = SAMPLE_RE.search(path)
+    if match:
+        return match.group(1)
+    basename = os.path.basename(path)
+    return basename.replace(".plot.tsv", "").replace(".tsv", "")
+
+
+def safe_float(text: str) -> float:
+    return float(text) if text not in ("", "NA", ".", None) else float("nan")
+
+
+def safe_int(text: str) -> int:
+    return int(float(text))
+
+
+def load_significant_windows(
+    plot_paths: Sequence[str],
+    delta_threshold: float,
+    flank: int,
+) -> List[WindowRecord]:
+    windows: List[WindowRecord] = []
+    for path in plot_paths:
+        sample = infer_sample_name(path)
+        with open(path, "r", encoding="utf-8") as handle:
+            reader = csv.reader(handle, delimiter="\t")
+            next(reader, None)
+            for row in reader:
+                if not row or row[0].startswith("#") or len(row) < 7:
+                    continue
+                delta_snp_index = safe_float(row[5])
+                if abs(delta_snp_index) <= delta_threshold:
+                    continue
+                center = safe_int(row[1])
+                windows.append(
+                    WindowRecord(
+                        sample=sample,
+                        chrom=row[0],
+                        center=center,
+                        threshold=safe_float(row[2]),
+                        high_snp_index=safe_float(row[3]),
+                        low_snp_index=safe_float(row[4]),
+                        delta_snp_index=delta_snp_index,
+                        snp_n=safe_int(row[6]),
+                        sign="positive" if delta_snp_index > 0 else "negative",
+                        region_start=max(1, center - flank),
+                        region_end=center + flank,
+                        source_plot=path,
+                    )
+                )
+    windows.sort(key=lambda item: (item.sample, item.chrom, item.center))
+    return windows
+
+
+def build_gene_index(genes: Sequence[GeneRecord]) -> Dict[str, List[GeneRecord]]:
+    gene_index: Dict[str, List[GeneRecord]] = defaultdict(list)
+    for gene in genes:
+        gene_index[gene.chrom].append(gene)
+    return gene_index
+
+
+def overlapping_genes(
+    genes_by_chrom: Dict[str, List[GeneRecord]],
+    chrom: str,
+    start: int,
+    end: int,
+) -> Iterable[GeneRecord]:
+    for gene in genes_by_chrom.get(chrom, []):
+        if gene.end < start:
+            continue
+        if gene.start > end:
+            break
+        yield gene
+
+
+def merge_sample_regions(windows: Sequence[WindowRecord]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    grouped: Dict[Tuple[str, str], List[WindowRecord]] = defaultdict(list)
+    for window in windows:
+        grouped[(window.sample, window.chrom)].append(window)
+
+    for (sample, chrom), items in sorted(grouped.items()):
+        items.sort(key=lambda item: item.region_start)
+        current_start = None
+        current_end = None
+        signs = set()
+        centers: List[str] = []
+        delta_values: List[float] = []
+        count = 0
+        for item in items:
+            if current_start is None:
+                current_start = item.region_start
+                current_end = item.region_end
+                signs = {item.sign}
+                centers = [str(item.center)]
+                delta_values = [item.delta_snp_index]
+                count = 1
+                continue
+            if item.region_start <= current_end:
+                current_end = max(current_end, item.region_end)
+                signs.add(item.sign)
+                centers.append(str(item.center))
+                delta_values.append(item.delta_snp_index)
+                count += 1
+            else:
+                rows.append(
+                    {
+                        "sample": sample,
+                        "chrom": chrom,
+                        "region_start": current_start,
+                        "region_end": current_end,
+                        "window_count": count,
+                        "direction_label": "mixed" if len(signs) > 1 else next(iter(signs)),
+                        "window_centers": ",".join(centers),
+                        "max_abs_delta": f"{max(abs(v) for v in delta_values):.6f}",
+                    }
+                )
+                current_start = item.region_start
+                current_end = item.region_end
+                signs = {item.sign}
+                centers = [str(item.center)]
+                delta_values = [item.delta_snp_index]
+                count = 1
+        if current_start is not None:
+            rows.append(
+                {
+                    "sample": sample,
+                    "chrom": chrom,
+                    "region_start": current_start,
+                    "region_end": current_end,
+                    "window_count": count,
+                    "direction_label": "mixed" if len(signs) > 1 else next(iter(signs)),
+                    "window_centers": ",".join(centers),
+                    "max_abs_delta": f"{max(abs(v) for v in delta_values):.6f}",
+                }
+            )
+    return rows
+
+
+def write_tsv(path: str, rows: Sequence[Dict[str, object]], fieldnames: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    genes = load_genes(args.gff3)
+    genes_by_chrom = build_gene_index(genes)
+    windows = load_significant_windows(args.plot_tsv, args.delta_threshold, args.flank)
+    sample_regions = merge_sample_regions(windows)
+
+    genes_tsv = os.path.join(args.output_dir, "gene_extract.genes.tsv")
+    genes_bed = os.path.join(args.output_dir, "gene_extract.genes.bed")
+    significant_windows_tsv = os.path.join(args.output_dir, "gene_extract.significant_windows.tsv")
+    sample_regions_tsv = os.path.join(args.output_dir, "gene_extract.sample_regions.tsv")
+    window_genes_tsv = os.path.join(args.output_dir, "gene_extract.window_genes.tsv")
+    sample_candidate_genes_tsv = os.path.join(args.output_dir, "gene_extract.sample_candidate_genes.tsv")
+
+    gene_rows: List[Dict[str, object]] = []
+    with open(genes_bed, "w", encoding="utf-8") as bed_handle:
+        for gene in genes:
+            bed_handle.write(
+                "\t".join(
+                    [gene.chrom, str(gene.start - 1), str(gene.end), gene.gene_id, gene.gene_name, gene.strand]
+                )
+                + "\n"
+            )
+            gene_rows.append(
+                {
+                    "chrom": gene.chrom,
+                    "gene_start": gene.start,
+                    "gene_end": gene.end,
+                    "strand": gene.strand,
+                    "gene_id": gene.gene_id,
+                    "gene_id_base": gene.gene_id_base,
+                    "gene_name": gene.gene_name,
+                    "attributes": gene.attributes,
+                }
+            )
+    write_tsv(genes_tsv, gene_rows, ["chrom", "gene_start", "gene_end", "strand", "gene_id", "gene_id_base", "gene_name", "attributes"])
+
+    significant_rows: List[Dict[str, object]] = []
+    for item in windows:
+        significant_rows.append(
+            {
+                "sample": item.sample,
+                "chrom": item.chrom,
+                "window_center": item.center,
+                "region_start": item.region_start,
+                "region_end": item.region_end,
+                "threshold": f"{item.threshold:.6f}",
+                "high_snp_index": f"{item.high_snp_index:.6f}",
+                "low_snp_index": f"{item.low_snp_index:.6f}",
+                "delta_snp_index": f"{item.delta_snp_index:.6f}",
+                "abs_delta_snp_index": f"{abs(item.delta_snp_index):.6f}",
+                "signal_direction": item.sign,
+                "snp_n": item.snp_n,
+                "source_plot": item.source_plot,
+            }
+        )
+    write_tsv(
+        significant_windows_tsv,
+        significant_rows,
+        ["sample", "chrom", "window_center", "region_start", "region_end", "threshold", "high_snp_index", "low_snp_index", "delta_snp_index", "abs_delta_snp_index", "signal_direction", "snp_n", "source_plot"],
+    )
+
+    write_tsv(
+        sample_regions_tsv,
+        sample_regions,
+        ["sample", "chrom", "region_start", "region_end", "window_count", "direction_label", "window_centers", "max_abs_delta"],
+    )
+
+    window_gene_rows: List[Dict[str, object]] = []
+    sample_gene_stats: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for item in windows:
+        for gene in overlapping_genes(genes_by_chrom, item.chrom, item.region_start, item.region_end):
+            window_gene_rows.append(
+                {
+                    "sample": item.sample,
+                    "chrom": item.chrom,
+                    "window_center": item.center,
+                    "region_start": item.region_start,
+                    "region_end": item.region_end,
+                    "signal_direction": item.sign,
+                    "delta_snp_index": f"{item.delta_snp_index:.6f}",
+                    "gene_id": gene.gene_id,
+                    "gene_id_base": gene.gene_id_base,
+                    "gene_name": gene.gene_name,
+                    "gene_start": gene.start,
+                    "gene_end": gene.end,
+                    "strand": gene.strand,
+                }
+            )
+            key = (item.sample, gene.gene_id)
+            entry = sample_gene_stats.setdefault(
+                key,
+                {
+                    "sample": item.sample,
+                    "gene_id": gene.gene_id,
+                    "gene_id_base": gene.gene_id_base,
+                    "gene_name": gene.gene_name,
+                    "chrom": gene.chrom,
+                    "gene_start": gene.start,
+                    "gene_end": gene.end,
+                    "strand": gene.strand,
+                    "hit_window_count": 0,
+                    "positive_window_count": 0,
+                    "negative_window_count": 0,
+                    "max_abs_delta": 0.0,
+                },
+            )
+            entry["hit_window_count"] += 1
+            if item.sign == "positive":
+                entry["positive_window_count"] += 1
+            else:
+                entry["negative_window_count"] += 1
+            entry["max_abs_delta"] = max(entry["max_abs_delta"], abs(item.delta_snp_index))
+
+    write_tsv(
+        window_genes_tsv,
+        window_gene_rows,
+        ["sample", "chrom", "window_center", "region_start", "region_end", "signal_direction", "delta_snp_index", "gene_id", "gene_id_base", "gene_name", "gene_start", "gene_end", "strand"],
+    )
+
+    sample_candidate_rows: List[Dict[str, object]] = []
+    for row in sorted(sample_gene_stats.values(), key=lambda item: (item["sample"], item["chrom"], item["gene_start"], item["gene_id"])):
+        positive_count = int(row["positive_window_count"])
+        negative_count = int(row["negative_window_count"])
+        if positive_count and negative_count:
+            direction = "mixed"
+        elif positive_count:
+            direction = "positive"
+        else:
+            direction = "negative"
+        sample_candidate_rows.append({**row, "direction_label": direction, "max_abs_delta": f"{float(row['max_abs_delta']):.6f}"})
+
+    write_tsv(
+        sample_candidate_genes_tsv,
+        sample_candidate_rows,
+        ["sample", "gene_id", "gene_id_base", "gene_name", "chrom", "gene_start", "gene_end", "strand", "hit_window_count", "positive_window_count", "negative_window_count", "direction_label", "max_abs_delta"],
+    )
+
+    print(f"[OK] generated at: {GENERATED_AT}")
+    print(f"[OK] genes: {genes_tsv}")
+    print(f"[OK] gene bed: {genes_bed}")
+    print(f"[OK] significant windows: {significant_windows_tsv}")
+    print(f"[OK] merged sample regions: {sample_regions_tsv}")
+    print(f"[OK] window genes: {window_genes_tsv}")
+    print(f"[OK] sample candidate genes: {sample_candidate_genes_tsv}")
+
+
+if __name__ == "__main__":
+    main()

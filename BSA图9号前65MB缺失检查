@@ -1,0 +1,31 @@
+1，snpindex滑动是9号中有前65MB空的
+2，位点的index是没有前65MB的
+3.1，vcf原始文件BSA_FINAL_ULTIMATE_FIXED.vcf.gz的位点全是”NON“
+3.2， BSA_FINAL_RESULT_COMPLETE.vcf.gz(来自亲本和混池”filterd“合并)的位点也没有前65MB的
+但是vcf是有可用位点的
+4，1、看9号染色体的gvcf和合成片段 2、看snpindex的脚本是不是有问题
+5，最快检验的办法就是重新转化9号，在50服务器，然后合并到一个全基因组全样本带过滤的最终vcf文件中
+但是这很慢，最好是可以直接用CHUNCK和9号的合成脚本直接合成
+整理9号的全部，用9号最快的方法合在genome，然后删除chunk和CHR09原来的头头尾尾
+merge -o ” A /data2/chenh/bsa/CleanData/BSA_FINAL_RESULT_COMPLETE.vcf.gz" 
+/data2/chenh/bsa/CleanData/Pool_Filtered_Draft.vcf.gz         Parents_Final_Raw.vcf.gz
+
+concat -o ./" B BSA_FINAL_ULTIMATE_FIXED.vcf.gz" Part1_Before09.vcf.gz 
+Chr09_Full_Perfect.vcf.gz Part3_After09.vcf.gz 由BSA_FINAL_RESULT_COMPLETE.vcf.gz合成的，加入了9的chunk位点
+
+filter   C "BSA_READY_FOR_PYTHON.vcf.gz”是用BSA_FINAL_ULTIMATE_FIXED.vcf.gz过滤得到的。QUAL>20 && MQ>30 && INFO/DP>10 && F_MISSING<0.5
+
+ D "BSA_READY_V2_RELAXED.vcf.gz" 用BSA_FINAL_ULTIMATE_FIXED.vcf.gz; QUAL>10 && INFO/DP>5 && F_MISSING<0.9，放宽过滤
+总结：A是直接合成的，发现9号有问题，B是把9号的chunk位点加入到合成的结果中，C是用A过滤得到的
+D是用A放宽过滤条件得到的。需要进一步检查9号染色体的数据和脚本，确保位点信息的完整性和准确性。
+
+下一步找到做图的是哪个：A:"BSA_FINAL_RESULT_COMPLETE.vcf.gz" 还有B "BSA_FINAL_ULTIMATE_FIXED.vcf.gz"
+，同时检查GVCF的chunk，如果是chunk的问题，那就赶紧找到脚本看看为什么有问题： zgrep -v "^#" chunk_000.g.vcf.gz | awk '$5!="<NON_REF>"' | wc -l 
+117754
+chunk没问题,
+可能就是转换vcf的脚本参数有问题，这一切都等我把9号整理完，合并上之后再操作，但是，先检查能不能算SNPINDEX
+gvcf没问题。vcf没有有效位点，基本上就是转换的参数问题了，将我的check片段给gpt检查，然后就可以往后做了
+错误原因一句话。把chunk的GVCF直接合并到全基因组VCF了，Gemini写脚本隐患太大，自己也要真正理解报错的原因
+和基本的输入输出和处理逻辑
+下午来系统分析一下为什么BSA会没有信号
+一定要检查亲本是否正确，图形和错误的

@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+生成时间: 2026-03-26
+脚本名称: gene_common
+脚本作用:
+1. 汇总 gene_extract 产出的各群体候选基因
+2. 统计每个基因被多少个群体支持
+3. 输出至少 2 个群体支持的交集基因
+4. 输出 5 个群体全部支持的高置信基因
+5. 保留正负方向信息，方便后续解释
+
+输入文件:
+- gene_extract.sample_candidate_genes.tsv
+
+输出文件:
+- gene_common.support_matrix.tsv
+- gene_common.at_least_2.tsv
+- gene_common.at_least_2.bed
+- gene_common.all_5.tsv
+- gene_common.all_5.bed
+
+使用方法:
+python gene_common \
+  --sample-candidate-tsv ./output/gene_extract/gene_extract.sample_candidate_genes.tsv \
+  --output-dir ./output/gene_common \
+  --min-support 2 \
+  --all-support 5
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+from collections import defaultdict
+from typing import Dict, List, Sequence
+
+
+GENERATED_AT = "2026-03-26"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="对多个群体的候选基因求交集并输出基因清单。")
+    parser.add_argument("--sample-candidate-tsv", required=True, help="gene_extract.sample_candidate_genes.tsv")
+    parser.add_argument("--output-dir", required=True, help="输出目录")
+    parser.add_argument("--min-support", type=int, default=2, help="至少多少个群体支持才保留")
+    parser.add_argument("--all-support", type=int, default=5, help="多少个群体全部支持，默认 5")
+    return parser.parse_args()
+
+
+def read_rows(path: str) -> List[Dict[str, str]]:
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        return list(reader)
+
+
+def write_tsv(path: str, rows: Sequence[Dict[str, object]], fieldnames: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def write_bed(path: str, rows: Sequence[Dict[str, object]]) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(
+                "\t".join(
+                    [
+                        str(row["chrom"]),
+                        str(int(row["gene_start"]) - 1),
+                        str(row["gene_end"]),
+                        str(row["gene_id"]),
+                        str(row["support_count"]),
+                        str(row["strand"]),
+                    ]
+                )
+                + "\n"
+            )
+
+
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    rows = read_rows(args.sample_candidate_tsv)
+    samples = sorted({row["sample"] for row in rows})
+    gene_map: Dict[str, Dict[str, object]] = {}
+    sample_support: Dict[str, Dict[str, Dict[str, object]]] = defaultdict(dict)
+
+    for row in rows:
+        gene_id = row["gene_id"]
+        gene_entry = gene_map.setdefault(
+            gene_id,
+            {
+                "gene_id": gene_id,
+                "gene_id_base": row["gene_id_base"],
+                "gene_name": row["gene_name"],
+                "chrom": row["chrom"],
+                "gene_start": int(row["gene_start"]),
+                "gene_end": int(row["gene_end"]),
+                "strand": row["strand"],
+                "max_abs_delta": 0.0,
+                "total_hit_window_count": 0,
+            },
+        )
+        direction = row["direction_label"]
+        sample = row["sample"]
+        sample_support[gene_id][sample] = {
+            "direction": direction,
+            "hit_window_count": int(row["hit_window_count"]),
+            "max_abs_delta": float(row["max_abs_delta"]),
+        }
+        gene_entry["total_hit_window_count"] += int(row["hit_window_count"])
+        gene_entry["max_abs_delta"] = max(gene_entry["max_abs_delta"], float(row["max_abs_delta"]))
+
+    support_rows: List[Dict[str, object]] = []
+    for gene_id, info in sorted(gene_map.items(), key=lambda item: (item[1]["chrom"], item[1]["gene_start"], item[0])):
+        support_info = sample_support[gene_id]
+        supporting_samples = sorted(support_info)
+        positive_samples = sorted([sample for sample, detail in support_info.items() if detail["direction"] == "positive"])
+        negative_samples = sorted([sample for sample, detail in support_info.items() if detail["direction"] == "negative"])
+        mixed_samples = sorted([sample for sample, detail in support_info.items() if detail["direction"] == "mixed"])
+        if positive_samples and negative_samples:
+            overall_direction = "mixed_between_samples"
+        elif mixed_samples:
+            overall_direction = "mixed_within_sample"
+        elif positive_samples:
+            overall_direction = "positive_only"
+        elif negative_samples:
+            overall_direction = "negative_only"
+        else:
+            overall_direction = "unknown"
+
+        row = {
+            "gene_id": gene_id,
+            "gene_id_base": info["gene_id_base"],
+            "gene_name": info["gene_name"],
+            "chrom": info["chrom"],
+            "gene_start": info["gene_start"],
+            "gene_end": info["gene_end"],
+            "strand": info["strand"],
+            "support_count": len(supporting_samples),
+            "supporting_samples": ",".join(supporting_samples),
+            "positive_samples": ",".join(positive_samples),
+            "negative_samples": ",".join(negative_samples),
+            "mixed_samples": ",".join(mixed_samples),
+            "overall_direction_label": overall_direction,
+            "total_hit_window_count": info["total_hit_window_count"],
+            "max_abs_delta": f"{info['max_abs_delta']:.6f}",
+        }
+        for sample in samples:
+            detail = support_info.get(sample)
+            row[f"support_{sample}"] = detail["direction"] if detail else "absent"
+        support_rows.append(row)
+
+    support_fields = [
+        "gene_id",
+        "gene_id_base",
+        "gene_name",
+        "chrom",
+        "gene_start",
+        "gene_end",
+        "strand",
+        "support_count",
+        "supporting_samples",
+        "positive_samples",
+        "negative_samples",
+        "mixed_samples",
+        "overall_direction_label",
+        "total_hit_window_count",
+        "max_abs_delta",
+    ] + [f"support_{sample}" for sample in samples]
+
+    support_matrix_tsv = os.path.join(args.output_dir, "gene_common.support_matrix.tsv")
+    write_tsv(support_matrix_tsv, support_rows, support_fields)
+
+    at_least_2_rows = [row for row in support_rows if int(row["support_count"]) >= args.min_support]
+    all_5_rows = [row for row in support_rows if int(row["support_count"]) >= args.all_support]
+
+    at_least_2_tsv = os.path.join(args.output_dir, "gene_common.at_least_2.tsv")
+    at_least_2_bed = os.path.join(args.output_dir, "gene_common.at_least_2.bed")
+    all_5_tsv = os.path.join(args.output_dir, "gene_common.all_5.tsv")
+    all_5_bed = os.path.join(args.output_dir, "gene_common.all_5.bed")
+
+    write_tsv(at_least_2_tsv, at_least_2_rows, support_fields)
+    write_bed(at_least_2_bed, at_least_2_rows)
+    write_tsv(all_5_tsv, all_5_rows, support_fields)
+    write_bed(all_5_bed, all_5_rows)
+
+    print(f"[OK] generated at: {GENERATED_AT}")
+    print(f"[OK] support matrix: {support_matrix_tsv}")
+    print(f"[OK] at least {args.min_support} groups: {at_least_2_tsv}")
+    print(f"[OK] at least {args.min_support} groups bed: {at_least_2_bed}")
+    print(f"[OK] all {args.all_support} groups: {all_5_tsv}")
+    print(f"[OK] all {args.all_support} groups bed: {all_5_bed}")
+
+
+if __name__ == "__main__":
+    main()

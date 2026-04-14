@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+生成时间: 2026-04-10
+脚本名称: gene_share_peak
+脚本作用:
+1. 读取多个 BSA plot.tsv 文件
+2. 提取每个样本的局部峰值 (Peak Calling)，并用 prominence 代替绝对数值大小过滤
+3. 在同一染色体及相同方向上，距离相近（相差在指定 window 范围内，默认 3MB）的跨样本峰，合并为“共有峰(Shared Peak Cluster)”
+4. 根据共有峰的最左最右峰顶点向两边延展指定距离（默认 1Mb），界定共有峰候选区间
+5. 输出共有峰的统计信息，并提取共有峰所覆盖的注释基因
+
+使用方法:
+python gene_share_peak \
+  --plot-tsv a.plot.tsv b.plot.tsv \
+  --gff3 Canz.genome.gff3 \
+  --output-dir ./output/gene_extract_SharePeak \
+  --prominence 0.02 \
+  --distance-window 3000000 \
+  --flank 1000000 \
+  --smooth-window 10 \
+  --min-width 5 \
+  --min-support 2
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Sequence, Tuple
+import numpy as np
+from scipy.signal import find_peaks
+
+GENERATED_AT = "2026-04-10"
+SAMPLE_RE = re.compile(r"joint_(\d+)_")
+
+
+@dataclass
+class PeakRecord:
+    sample: str
+    chrom: str
+    pos: int
+    sign: str
+    delta_val: float
+
+
+@dataclass
+class PeakCluster:
+    cluster_id: str
+    chrom: str
+    sign: str
+    peaks: List[PeakRecord]
+
+    @property
+    def min_pos(self) -> int:
+        return min(p.pos for p in self.peaks)
+
+    @property
+    def max_pos(self) -> int:
+        return max(p.pos for p in self.peaks)
+
+    @property
+    def support_samples(self) -> set[str]:
+        return {p.sample for p in self.peaks}
+
+    @property
+    def support_count(self) -> int:
+        return len(self.support_samples)
+
+    def region_start(self, flank: int) -> int:
+        return max(1, self.min_pos - flank)
+
+    def region_end(self, flank: int) -> int:
+        return self.max_pos + flank
+
+
+@dataclass
+class GeneRecord:
+    chrom: str
+    start: int
+    end: int
+    strand: str
+    gene_id: str
+    gene_id_base: str
+    gene_name: str
+    attributes: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="跨样本共有峰鉴定与基因提取")
+    parser.add_argument("--plot-tsv", nargs="+", required=True, help="多个 BSA plot.tsv 文件路径")
+    parser.add_argument("--gff3", required=True, help="基因组 GFF3 注释文件")
+    parser.add_argument("--output-dir", required=True, help="输出目录")
+    parser.add_argument(
+        "--prominence",
+        type=float,
+        default=0.02,
+        help="峰值检测的局部突出高度(相对隆起)，取代绝对阈值。默认: 0.02",
+    )
+    parser.add_argument(
+        "--distance-window",
+        type=int,
+        default=3000000,
+        help="跨样本峰归属同一簇的最大距离(单链聚类)，默认合并 3Mb 内的相邻同频峰",
+    )
+    parser.add_argument(
+        "--flank",
+        type=int,
+        default=1_000_000,
+        help="以共有峰边界(Min-Max)向两边拓展的距离，默认 1Mb",
+    )
+    parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=10,
+        help="移动平均窗口大小。如果每个点相差大概 0.3Mb，则 10 意味着约 3Mb 的平滑窗口。默认 10。",
+    )
+    parser.add_argument(
+        "--min-width",
+        type=int,
+        default=5,
+        help="要求峰的底层宽度至少跨越多少个点。默认 5，意味着只识别连续凸起的宽峰，抛弃尖刺。",
+    )
+    parser.add_argument(
+        "--min-support",
+        type=int,
+        default=2,
+        help="有效共有峰簇所需要的最少支持群体数，默认提取 >= 2 的特征基因",
+    )
+    return parser.parse_args()
+
+
+def parse_attributes(attr_text: str) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for raw_field in attr_text.strip().strip(";").split(";"):
+        field = raw_field.strip()
+        if not field:
+            continue
+        if "=" in field:
+            key, value = field.split("=", 1)
+        elif " " in field:
+            key, value = field.split(" ", 1)
+            value = value.strip('"')
+        else:
+            continue
+        result[key.strip()] = value.strip()
+    return result
+
+
+def choose_gene_name(attr_map: Dict[str, str]) -> str:
+    for key in ("Name", "gene_name", "gene", "geneID", "locus_tag", "ID"):
+        value = attr_map.get(key)
+        if value:
+            return value
+    return "."
+
+
+def load_genes(gff3_path: str) -> List[GeneRecord]:
+    genes: List[GeneRecord] = []
+    with open(gff3_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 9:
+                continue
+            chrom, _, feature_type, start_s, end_s, _, strand, _, attr_text = parts
+            if feature_type != "gene":
+                continue
+            attr_map = parse_attributes(attr_text)
+            gene_id = attr_map.get("ID") or attr_map.get("gene_id") or choose_gene_name(attr_map)
+            gene_name = choose_gene_name(attr_map)
+            genes.append(
+                GeneRecord(
+                    chrom=chrom,
+                    start=int(start_s),
+                    end=int(end_s),
+                    strand=strand,
+                    gene_id=gene_id,
+                    gene_id_base=gene_id.split(".", 1)[0],
+                    gene_name=gene_name,
+                    attributes=attr_text,
+                )
+            )
+    genes.sort(key=lambda item: (item.chrom, item.start, item.end, item.gene_id))
+    return genes
+
+
+def infer_sample_name(path: str) -> str:
+    match = SAMPLE_RE.search(path)
+    if match:
+        return match.group(1)
+    return os.path.basename(path).replace(".plot.tsv", "").replace(".tsv", "")
+
+
+def safe_float(text: str) -> float:
+    return float(text) if text not in ("", "NA", ".", None) else float("nan")
+
+
+def safe_int(text: str) -> int:
+    return int(float(text))
+
+
+def detect_peaks_for_sample(
+    path: str, prominence: float, smooth_window: int, min_width: int
+) -> List[PeakRecord]:
+    sample = infer_sample_name(path)
+    # chrom -> list of (pos, delta)
+    data: Dict[str, Tuple[List[int], List[float]]] = defaultdict(lambda: ([], []))
+    
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.reader(handle, delimiter="\t")
+        next(reader, None)  # header
+        for row in reader:
+            if not row or row[0].startswith("#") or len(row) < 7:
+                continue
+            chrom = row[0]
+            pos = safe_int(row[1])
+            delta = safe_float(row[5])
+            if not np.isnan(delta):
+                data[chrom][0].append(pos)
+                data[chrom][1].append(delta)
+
+    peaks_all: List[PeakRecord] = []
+    
+    for chrom, (pos_list, delta_list) in data.items():
+        if not pos_list:
+            continue
+            
+        pos_arr = np.array(pos_list)
+        raw_delta_arr = np.array(delta_list)
+        
+        # Apply smoothing
+        if smooth_window > 1:
+            pad_width = smooth_window // 2
+            padded = np.pad(raw_delta_arr, pad_width, mode='edge')
+            delta_arr = np.convolve(padded, np.ones(smooth_window)/smooth_window, mode='valid')
+            delta_arr = delta_arr[:len(raw_delta_arr)]
+        else:
+            delta_arr = raw_delta_arr
+        
+        # Positive peaks
+        pos_idx, _ = find_peaks(delta_arr, prominence=prominence, width=min_width)
+        for idx in pos_idx:
+            peaks_all.append(
+                PeakRecord(
+                    sample=sample,
+                    chrom=chrom,
+                    pos=pos_arr[idx],
+                    sign="positive",
+                    delta_val=delta_arr[idx],
+                )
+            )
+            
+        # Negative peaks (invert the array)
+        neg_idx, _ = find_peaks(-1 * delta_arr, prominence=prominence, width=min_width)
+        for idx in neg_idx:
+            peaks_all.append(
+                PeakRecord(
+                    sample=sample,
+                    chrom=chrom,
+                    pos=pos_arr[idx],
+                    sign="negative",
+                    delta_val=delta_arr[idx],
+                )
+            )
+            
+    return peaks_all
+
+
+def cluster_peaks(
+    all_peaks: List[PeakRecord], distance_window: int
+) -> List[PeakCluster]:
+    # Group by chrom and sign
+    grouped: Dict[Tuple[str, str], List[PeakRecord]] = defaultdict(list)
+    for p in all_peaks:
+        grouped[(p.chrom, p.sign)].append(p)
+        
+    clusters: List[PeakCluster] = []
+    cluster_idx = 1
+    
+    for (chrom, sign), peaks in sorted(grouped.items()):
+        # Sort by pos ascending
+        peaks.sort(key=lambda x: x.pos)
+        
+        # Single linkage clustering
+        current_peaks = []
+        for p in peaks:
+            if not current_peaks:
+                current_peaks.append(p)
+            else:
+                if p.pos - current_peaks[-1].pos <= distance_window:
+                    current_peaks.append(p)
+                else:
+                    cluster_id = f"Cluster_{cluster_idx:04d}_{chrom}_{sign}"
+                    clusters.append(PeakCluster(cluster_id, chrom, sign, current_peaks))
+                    cluster_idx += 1
+                    current_peaks = [p]
+        if current_peaks:
+            cluster_id = f"Cluster_{cluster_idx:04d}_{chrom}_{sign}"
+            clusters.append(PeakCluster(cluster_id, chrom, sign, current_peaks))
+            cluster_idx += 1
+            
+    return clusters
+
+
+def build_gene_index(genes: Sequence[GeneRecord]) -> Dict[str, List[GeneRecord]]:
+    gene_index: Dict[str, List[GeneRecord]] = defaultdict(list)
+    for gene in genes:
+        gene_index[gene.chrom].append(gene)
+    return gene_index
+
+
+def overlapping_genes(
+    genes_by_chrom: Dict[str, List[GeneRecord]], chrom: str, start: int, end: int
+) -> Iterable[GeneRecord]:
+    for gene in genes_by_chrom.get(chrom, []):
+        if gene.end < start:
+            continue
+        if gene.start > end:
+            break
+        yield gene
+
+
+def write_tsv(path: str, rows: Sequence[Dict[str, object]], fieldnames: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print(f"Loading GFF3: {args.gff3}")
+    genes = load_genes(args.gff3)
+    genes_by_chrom = build_gene_index(genes)
+    
+    # 1. Peak Detection
+    all_peaks: List[PeakRecord] = []
+    for plot_path in args.plot_tsv:
+        print(f"Detecting peaks (prominence >= {args.prominence}, smooth = {args.smooth_window}, width >= {args.min_width}) in: {plot_path}")
+        sample_peaks = detect_peaks_for_sample(plot_path, args.prominence, args.smooth_window, args.min_width)
+        all_peaks.extend(sample_peaks)
+        
+    print(f"Total peak points detected across all samples: {len(all_peaks)}")
+
+    # 2. Clustering
+    clusters = cluster_peaks(all_peaks, args.distance_window)
+    print(f"Total shared peak clusters identified (dist <= {args.distance_window}): {len(clusters)}")
+    
+    # Export all clusters info
+    cluster_tsv_path = os.path.join(args.output_dir, "share_peak.all_clusters.tsv")
+    cluster_rows = []
+    for c in clusters:
+        # Sort peak details for readability
+        details = sorted([(p.sample, p.pos, p.delta_val) for p in c.peaks], key=lambda x: x[1])
+        detail_str = ";".join([f"{s}({p/1000000:.2f}M:{v:.4f})" for s, p, v in details])
+        cluster_rows.append({
+            "cluster_id": c.cluster_id,
+            "chrom": c.chrom,
+            "sign": c.sign,
+            "support_count": c.support_count,
+            "support_samples": ",".join(sorted(c.support_samples)),
+            "min_peak_pos": c.min_pos,
+            "max_peak_pos": c.max_pos,
+            "boundary_width_bp": c.max_pos - c.min_pos,
+            "region_start": c.region_start(args.flank),
+            "region_end": c.region_end(args.flank),
+            "peak_details": detail_str
+        })
+    write_tsv(
+        cluster_tsv_path, cluster_rows, 
+        ["cluster_id", "chrom", "sign", "support_count", "support_samples", "min_peak_pos", "max_peak_pos", "boundary_width_bp", "region_start", "region_end", "peak_details"]
+    )
+    print(f"[OK] Wrote all shared clusters info to: {cluster_tsv_path}")
+    
+    # 3. Filter clusters by min support and extract features
+    valid_clusters = [c for c in clusters if c.support_count >= args.min_support]
+    print(f"Clusters passing minimum support (>= {args.min_support}): {len(valid_clusters)}")
+    
+    # Export valid regions BED
+    regions_bed_path = os.path.join(args.output_dir, f"share_peak.support_ge_{args.min_support}.bed")
+    with open(regions_bed_path, "w", encoding="utf-8") as bed_f:
+        for c in valid_clusters:
+            bed_f.write(f"{c.chrom}\t{max(0, c.region_start(args.flank)-1)}\t{c.region_end(args.flank)}\t{c.cluster_id}\t{c.support_count}\t{'+' if c.sign=='positive' else '-'}\n")
+    print(f"[OK] Wrote filtered clusters regions to BED: {regions_bed_path}")
+
+    # 4. Extract target Genes and generate Gene Summary Table
+    # A gene might fall into multiple valid clusters (e.g. positive and negative overlaps).
+    # map gene -> dict of cluster features
+    gene_cluster_map: Dict[str, List[PeakCluster]] = defaultdict(list)
+    
+    for c in valid_clusters:
+        r_start = c.region_start(args.flank)
+        r_end = c.region_end(args.flank)
+        for gene in overlapping_genes(genes_by_chrom, c.chrom, r_start, r_end):
+            gene_cluster_map[gene.gene_id].append(c)
+            
+    gene_summary_rows = []
+    # To quickly grab gene info by ID
+    gene_info_map = {g.gene_id: g for g in genes}
+    
+    for gid, overlapping_clusters in gene_cluster_map.items():
+        g_info = gene_info_map[gid]
+        
+        # Aggregate stats
+        all_samples = set()
+        pos_samples = set()
+        neg_samples = set()
+        hit_cluster_ids = []
+        
+        for c in overlapping_clusters:
+            hit_cluster_ids.append(c.cluster_id)
+            all_samples.update(c.support_samples)
+            if c.sign == "positive":
+                pos_samples.update(c.support_samples)
+            else:
+                neg_samples.update(c.support_samples)
+                
+        if len(pos_samples) > 0 and len(neg_samples) > 0:
+            dir_label = "mixed"
+        elif len(pos_samples) > 0:
+            dir_label = "positive_only"
+        else:
+            dir_label = "negative_only"
+            
+        gene_summary_rows.append({
+            "gene_id": gid,
+            "gene_name": g_info.gene_name,
+            "chrom": g_info.chrom,
+            "gene_start": g_info.start,
+            "gene_end": g_info.end,
+            "strand": g_info.strand,
+            "total_support_samples_count": len(all_samples),
+            "total_support_samples": ",".join(sorted(all_samples)),
+            "positive_support_samples": ",".join(sorted(pos_samples)),
+            "negative_support_samples": ",".join(sorted(neg_samples)),
+            "overall_direction_label": dir_label,
+            "hit_cluster_count": len(hit_cluster_ids),
+            "hit_clusters": ",".join(hit_cluster_ids)
+        })
+        
+    # Sort output genes by chrom, start
+    gene_summary_rows.sort(key=lambda x: (x["chrom"], x["gene_start"]))
+    
+    genes_tsv_path = os.path.join(args.output_dir, f"share_peak.candidate_genes.support_ge_{args.min_support}.tsv")
+    write_tsv(
+        genes_tsv_path, gene_summary_rows,
+        ["gene_id", "gene_name", "chrom", "gene_start", "gene_end", "strand", "total_support_samples_count", "total_support_samples", "positive_support_samples", "negative_support_samples", "overall_direction_label", "hit_cluster_count", "hit_clusters"]
+    )
+    print(f"[OK] Wrote extracted shared-peak genes to: {genes_tsv_path}")
+    print(f"[Finished] Run strictly complete at {GENERATED_AT}")
+
+
+if __name__ == "__main__":
+    main()

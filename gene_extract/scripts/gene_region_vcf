@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+生成时间: 2026-03-27
+脚本名称: gene_region_vcf
+脚本作用:
+1. 从交集基因 BED 中提取 joint VCF 的基因体变异
+2. 使用外部 GTF 构建 Annovar 所需的 refGene 数据集
+3. 使用 convert2annovar.pl 和 annotate_variation.pl 完成变异注释
+
+输入文件:
+- 交集基因 BED
+- 交集基因 TSV
+- joint VCF / VCF.GZ
+- 参考基因组 FASTA
+- 外部 GTF
+
+输出文件:
+- gene_region_vcf.<label>.vcf.gz
+- gene_region_vcf.<label>.vcf.gz.tbi
+- gene_region_vcf.<label>.vcf
+- gene_region_vcf.<label>.avinput
+- gene_region_vcf.<label>.variant_function
+- gene_region_vcf.<label>.exonic_variant_function
+- gene_region_vcf.<label>.genes.tsv
+- gene_region_vcf.<label>.command.log
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import subprocess
+from typing import Dict, List, Sequence
+
+
+GENERATED_AT = "2026-03-27"
+DEFAULT_GTF = "/data2/chenh/bsa/CleanData/bsa_HunchiData/BSA_out/output/gene_extract/output/gene_region_vcf/at_least_2/Canz.genome.gtf"
+DEFAULT_ANNOVAR_DIR = "/data2/yangxl/biosoft/annovar"
+DEFAULT_BCFTOOLS = "/data/chenh/miniconda3/envs/tools/bin/bcftools"
+DEFAULT_GTFTOPROGEN = "gtfToGenePred"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="从交集基因 BED 提取变异，并基于外部 GTF 完成 Annovar 注释。"
+    )
+    parser.add_argument("--gene-bed", required=True, help="交集基因 BED")
+    parser.add_argument("--gene-table", required=True, help="交集基因 TSV")
+    parser.add_argument("--vcf", required=True, help="joint VCF / VCF.GZ")
+    parser.add_argument("--reference-fasta", required=True, help="参考基因组 FASTA")
+    parser.add_argument("--gtf", default=DEFAULT_GTF, help="外部 GTF")
+    parser.add_argument("--label", required=True, help="当前基因集合标签，例如 at_least_2 / all_5")
+    parser.add_argument("--output-dir", required=True, help="输出目录")
+    parser.add_argument("--annovar-dir", default=DEFAULT_ANNOVAR_DIR, help="Annovar 安装目录")
+    parser.add_argument("--bcftools-bin", default=DEFAULT_BCFTOOLS, help="bcftools 路径")
+    parser.add_argument("--tabix-bin", default="tabix", help="tabix 路径")
+    parser.add_argument("--gtfToGenePred-bin", default=DEFAULT_GTFTOPROGEN, help="gtfToGenePred 路径")
+    parser.add_argument("--build-name", default="canz", help="Annovar build 名称")
+    return parser.parse_args()
+
+
+def run_command(command: Sequence[str], log_handle) -> None:
+    log_handle.write("$ " + " ".join(command) + "\n")
+    log_handle.flush()
+    process = subprocess.run(command, stdout=log_handle, stderr=log_handle, check=False, text=True)
+    if process.returncode != 0:
+        raise SystemExit(f"Command failed with exit code {process.returncode}: {' '.join(command)}")
+
+
+def run_command_allow_failure(command: Sequence[str], log_handle) -> int:
+    log_handle.write("$ " + " ".join(command) + "\n")
+    log_handle.flush()
+    process = subprocess.run(command, stdout=log_handle, stderr=log_handle, check=False, text=True)
+    return process.returncode
+
+
+def load_gene_table(path: str) -> List[Dict[str, str]]:
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        return list(reader)
+
+
+def write_tsv(path: str, rows: Sequence[Dict[str, str]], fieldnames: Sequence[str]) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def write_empty_outputs(output_dir: str, label: str) -> None:
+    prefix = os.path.join(output_dir, f"gene_region_vcf.{label}")
+    with open(prefix + ".genes.tsv", "w", encoding="utf-8") as out:
+        out.write("gene_id\n")
+    for suffix in [".avinput", ".variant_function", ".exonic_variant_function"]:
+        with open(prefix + suffix, "w", encoding="utf-8") as out:
+            out.write("")
+    with open(prefix + ".command.log", "w", encoding="utf-8") as out:
+        out.write(f"# generated_at\t{GENERATED_AT}\n")
+        out.write(f"# label\t{label}\n")
+        out.write("# no genes found in this gene set, annovar steps skipped\n")
+
+
+def ensure_non_empty_file(path: str, label: str) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise SystemExit(f"{label} was not created or is empty: {path}")
+
+
+def main() -> None:
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    db_dir = os.path.join(args.output_dir, "annovar_db")
+    os.makedirs(db_dir, exist_ok=True)
+
+    gene_rows = load_gene_table(args.gene_table)
+    gene_ids = [row["gene_id"] for row in gene_rows]
+    if not gene_ids:
+        write_empty_outputs(args.output_dir, args.label)
+        print(f"[OK] generated at: {GENERATED_AT}")
+        print(f"[OK] gene set {args.label} is empty, annovar steps skipped")
+        return
+
+    if not os.path.exists(args.gtf):
+        raise SystemExit(f"GTF file not found: {args.gtf}")
+
+    log_path = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}.command.log")
+    subset_gene_tsv = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}.genes.tsv")
+    region_vcf_gz = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}.vcf.gz")
+    raw_region_vcf_gz = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}.raw.vcf.gz")
+    region_vcf = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}.vcf")
+    avinput_path = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}.avinput")
+    annovar_prefix = os.path.join(args.output_dir, f"gene_region_vcf.{args.label}")
+    refgene_txt = os.path.join(db_dir, f"{args.build_name}_refGene.txt")
+    mrna_fa_prefix = os.path.join(db_dir, f"{args.build_name}_refGeneMrna")
+
+    write_tsv(subset_gene_tsv, gene_rows, list(gene_rows[0].keys()))
+
+    convert2annovar = os.path.join(args.annovar_dir, "convert2annovar.pl")
+    annotate_variation = os.path.join(args.annovar_dir, "annotate_variation.pl")
+    retrieve_seq = os.path.join(args.annovar_dir, "retrieve_seq_from_fasta.pl")
+
+    with open(log_path, "w", encoding="utf-8") as log_handle:
+        log_handle.write(f"# generated_at\t{GENERATED_AT}\n")
+        log_handle.write(f"# label\t{args.label}\n")
+        log_handle.write(f"# gene_count\t{len(gene_ids)}\n")
+        log_handle.write(f"# gtf\t{args.gtf}\n")
+        log_handle.flush()
+
+        run_command([args.bcftools_bin, "view", "-R", args.gene_bed, "-Oz", "-o", raw_region_vcf_gz, args.vcf], log_handle)
+        run_command([args.bcftools_bin, "sort", "-Oz", "-o", region_vcf_gz, raw_region_vcf_gz], log_handle)
+        run_command([args.tabix_bin, "-f", "-p", "vcf", region_vcf_gz], log_handle)
+        run_command([args.bcftools_bin, "view", "-Ov", "-o", region_vcf, region_vcf_gz], log_handle)
+        gtf_returncode = run_command_allow_failure(
+            [args.gtfToGenePred_bin, "-genePredExt", args.gtf, refgene_txt],
+            log_handle,
+        )
+        ensure_non_empty_file(refgene_txt, "Annovar refGene table")
+        if gtf_returncode != 0:
+            log_handle.write(
+                f"# warning\tgtfToGenePred exited with code {gtf_returncode}, "
+                f"but {refgene_txt} is present and non-empty; continuing\n"
+            )
+            log_handle.flush()
+        else:
+            log_handle.write("# gtfToGenePred finished successfully\n")
+            log_handle.flush()
+        run_command(
+            [
+                "perl",
+                retrieve_seq,
+                "--format",
+                "refGene",
+                "--seqfile",
+                args.reference_fasta,
+                refgene_txt,
+                "--out",
+                mrna_fa_prefix,
+            ],
+            log_handle,
+        )
+        mrna_fa_candidates = [mrna_fa_prefix, mrna_fa_prefix + ".fa"]
+        mrna_fa_path = None
+        for candidate in mrna_fa_candidates:
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                mrna_fa_path = candidate
+                break
+        if mrna_fa_path is None:
+            raise SystemExit(
+                "Annovar refGeneMrna FASTA was not created or is empty: "
+                + " / ".join(mrna_fa_candidates)
+            )
+        log_handle.write(f"# refGeneMrna_fasta\t{mrna_fa_path}\n")
+        log_handle.flush()
+
+        with open(avinput_path, "w", encoding="utf-8") as avinput_handle:
+            process = subprocess.run(
+                ["perl", convert2annovar, "-format", "vcf4", region_vcf],
+                stdout=avinput_handle,
+                stderr=log_handle,
+                check=False,
+                text=True,
+            )
+            if process.returncode != 0:
+                raise SystemExit(f"convert2annovar.pl failed with exit code {process.returncode}")
+
+        run_command(
+            ["perl", annotate_variation, "-out", annovar_prefix, "-build", args.build_name, avinput_path, db_dir],
+            log_handle,
+        )
+
+    ensure_non_empty_file(region_vcf_gz, "Extracted gene-region VCF")
+    ensure_non_empty_file(region_vcf_gz + ".tbi", "VCF index")
+    ensure_non_empty_file(region_vcf, "Plain VCF for annovar")
+    ensure_non_empty_file(avinput_path, "Annovar avinput")
+    ensure_non_empty_file(annovar_prefix + ".variant_function", "variant_function")
+
+    print(f"[OK] generated at: {GENERATED_AT}")
+    print(f"[OK] gene subset: {subset_gene_tsv}")
+    print(f"[OK] gene subset gtf: {args.gtf}")
+    print(f"[OK] extracted vcf: {region_vcf_gz}")
+    print(f"[OK] avinput: {avinput_path}")
+    print(f"[OK] variant function: {annovar_prefix}.variant_function")
+    print(f"[OK] command log: {log_path}")
+
+
+if __name__ == "__main__":
+    main()
