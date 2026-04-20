@@ -1,0 +1,13 @@
+.snakemake/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tmp
+*.bak
+
+results/*
+!results/.gitkeep
+
+temp/*
+!temp/.gitkeep

@@ -1,0 +1,12 @@
+ ## 项目目的：针对vcf和snpindex文件设计kasp标记，以F2:3代为例
+ ## 执行步骤
+ 1.原始文件data导入
+ 1.1 导入F2:3代vcf文件
+ 1.2 导入F2:3代snpindex文件
+ 2.整理之前的snpindex提取脚本和查看附近snp位点的脚本（参考后直接重写），整合到出kasp标记的结果表的文件脚本（给脚本增加注释）,已经放到D:\app\.codex\project\BSA\KASP_signal_design\scripts了
+ 3.写脚本计划，用codex仔细列计划，用opus来检查问题，用gemini来review脚本
+## 详细计划
+1.先找到群体以及对应的染色体及其坐标
+2.提取坐标向内收的1MB区间内的变异位点，用脚本KASP_signal_design/scripts/ex_snpindex.py提取
+3.筛选前后50bp没有其他变异的位点，用脚本KASP_signal_design/scripts/isolated_snp_100.sh
+4.提取位点的序列并转换格式（脚本KASP_signal_design/scripts/extract_fa.py    直接可用）
