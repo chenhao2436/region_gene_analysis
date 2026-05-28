@@ -78,7 +78,7 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 
 def load_candidates(path: Path) -> dict[str, list[Candidate]]:
-    grouped: dict[str, list[Candidate]] = {"left": [], "right": []}
+    grouped: dict[str, list[Candidate]] = {}
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         required = {"side", "chrom", "pos", "delta_snp_index", "rank"}
@@ -86,8 +86,7 @@ def load_candidates(path: Path) -> dict[str, list[Candidate]]:
             raise ValueError("候选表缺少必要列: side/chrom/pos/delta_snp_index/rank")
         for row in reader:
             side = row["side"].strip()
-            if side not in grouped:
-                continue
+            grouped.setdefault(side, [])
             grouped[side].append(
                 Candidate(
                     side=side,
@@ -240,7 +239,7 @@ def filter_candidates(
     checked_rows: list[dict[str, str]] = []
     pass_rows: list[dict[str, str]] = []
 
-    for side in ("left", "right"):
+    for side in grouped_candidates:
         side_candidates = grouped_candidates.get(side, [])
         side_pass_count = 0
         for index, candidate in enumerate(side_candidates, start=1):

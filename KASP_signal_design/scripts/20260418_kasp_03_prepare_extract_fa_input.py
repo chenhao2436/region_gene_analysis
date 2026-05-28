@@ -86,22 +86,30 @@ def write_recommended(
     pass_rows: list[dict[str, str]],
     target_count: int,
 ) -> list[dict[str, str]]:
-    grouped_checked = {"left": [], "right": []}
-    grouped_pass = {"left": [], "right": []}
+    grouped_checked: dict[str, list[dict[str, str]]] = {}
+    grouped_pass: dict[str, list[dict[str, str]]] = {}
+    side_order: list[str] = []
     for row in checked_rows:
-        if row["side"] in grouped_checked:
-            grouped_checked[row["side"]].append(row)
+        side = row["side"]
+        if side not in grouped_checked:
+            grouped_checked[side] = []
+            side_order.append(side)
+        grouped_checked[side].append(row)
     for row in pass_rows:
-        if row["side"] in grouped_pass:
-            grouped_pass[row["side"]].append(row)
+        side = row["side"]
+        if side not in grouped_pass:
+            grouped_pass[side] = []
+        if side not in side_order:
+            side_order.append(side)
+        grouped_pass[side].append(row)
 
     selected_rows: list[dict[str, str]] = []
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RECOMMENDED_FIELDS, delimiter="\t")
         writer.writeheader()
-        for side in ("left", "right"):
-            side_checked = sort_rows(grouped_checked[side])
-            side_pass = sort_rows(grouped_pass[side])[:target_count]
+        for side in side_order:
+            side_checked = sort_rows(grouped_checked.get(side, []))
+            side_pass = sort_rows(grouped_pass.get(side, []))[:target_count]
             shortage_reason = summarize_shortage(side_checked, side_pass, target_count)
             if side_pass:
                 for row in side_pass:
@@ -110,7 +118,7 @@ def write_recommended(
                         "selected_count": len(side_pass),
                         "target_count": target_count,
                         "checked_candidates": len(side_checked),
-                        "pass_count": len(grouped_pass[side]),
+                        "pass_count": len(grouped_pass.get(side, [])),
                         "shortage_reason": shortage_reason,
                         "chrom": row["chrom"],
                         "pos": row["pos"],
@@ -132,7 +140,7 @@ def write_recommended(
                         "selected_count": 0,
                         "target_count": target_count,
                         "checked_candidates": len(side_checked),
-                        "pass_count": len(grouped_pass[side]),
+                        "pass_count": len(grouped_pass.get(side, [])),
                         "shortage_reason": shortage_reason,
                         "chrom": "",
                         "pos": "",

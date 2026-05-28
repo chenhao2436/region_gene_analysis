@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-summary", required=True, help="汇总表输出路径")
     parser.add_argument("--initial-rank-limit", type=int, default=20, help="前筛候选数, 默认 20")
     parser.add_argument("--expansion-step-bp", type=int, default=ONE_MB, help="每次向峰区中心扩宽的步长, 默认 1000000 bp")
+    parser.add_argument("--selection-mode", choices=("flank", "bin"), default="flank", help="flank=two ends; bin=one marker per bin")
+    parser.add_argument("--bin-size-bp", type=int, default=ONE_MB, help="bin mode window size, default 1000000 bp")
     return parser.parse_args()
 
 
@@ -135,6 +137,29 @@ def build_windows(chrom: str, start_bp: int, end_bp: int) -> list[Window]:
     ]
 
 
+def build_bin_windows(chrom: str, start_bp: int, end_bp: int, bin_size_bp: int) -> list[Window]:
+    if bin_size_bp <= 0:
+        raise ValueError("bin-size-bp must be greater than 0")
+    windows: list[Window] = []
+    current_start = start_bp
+    index = 1
+    while current_start <= end_bp:
+        current_end = min(end_bp, current_start + bin_size_bp)
+        windows.append(
+            Window(
+                side=f"bin_{index:03d}",
+                chrom=chrom,
+                start=current_start,
+                end=current_end,
+                initial_start=current_start,
+                initial_end=current_end,
+            )
+        )
+        current_start = current_end + 1
+        index += 1
+    return windows
+
+
 def normalize_header_name(value: str) -> str:
     return value.strip().lstrip("#").upper().replace("-", "_")
 
@@ -160,6 +185,8 @@ def iter_rows(path: Path) -> Iterable[list[str]]:
 
 
 def calculate_expansion_level(window: Window, pos: int, expansion_step_bp: int) -> int:
+    if window.side not in {"left", "right"}:
+        return 0
     if window.side == "left":
         if pos <= window.initial_end:
             return 0
@@ -174,7 +201,9 @@ def calculate_expansion_level(window: Window, pos: int, expansion_step_bp: int) 
 def expansion_window_end(window: Window, expansion_level: int, expansion_step_bp: int) -> tuple[int, int]:
     if window.side == "left":
         return window.start, min(window.end, window.initial_end + expansion_level * expansion_step_bp)
-    return max(window.start, window.initial_start - expansion_level * expansion_step_bp), window.end
+    if window.side == "right":
+        return max(window.start, window.initial_start - expansion_level * expansion_step_bp), window.end
+    return window.start, window.end
 
 
 def collect_candidates(snpindex_path: Path, windows: Sequence[Window], expansion_step_bp: int) -> list[Candidate]:
@@ -188,10 +217,7 @@ def collect_candidates(snpindex_path: Path, windows: Sequence[Window], expansion
     data_rows = rows if has_header else chain([first_row], rows)
 
     by_side: dict[str, list[tuple[int, float, int]]] = {window.side: [] for window in windows}
-    left_window = next(item for item in windows if item.side == "left")
-    right_window = next(item for item in windows if item.side == "right")
-    target_chrom = left_window.chrom
-    midpoint = left_window.end
+    target_chrom = windows[0].chrom
 
     for row in data_rows:
         if max(chrom_idx, pos_idx, delta_idx) >= len(row):
@@ -206,20 +232,19 @@ def collect_candidates(snpindex_path: Path, windows: Sequence[Window], expansion
             continue
         if math.isnan(delta) or delta <= 0:
             continue
-        if pos <= midpoint and left_window.start <= pos <= left_window.end:
-            by_side["left"].append((pos, delta, calculate_expansion_level(left_window, pos, expansion_step_bp)))
-        elif pos >= midpoint + 1 and right_window.start <= pos <= right_window.end:
-            by_side["right"].append((pos, delta, calculate_expansion_level(right_window, pos, expansion_step_bp)))
+        for window in windows:
+            if window.start <= pos <= window.end:
+                by_side[window.side].append((pos, delta, calculate_expansion_level(window, pos, expansion_step_bp)))
+                break
 
     candidates: list[Candidate] = []
-    for side in ("left", "right"):
-        window = next(item for item in windows if item.side == side)
-        sorted_rows = sorted(by_side[side], key=lambda item: (item[2], -item[1], item[0]))
+    for window in windows:
+        sorted_rows = sorted(by_side[window.side], key=lambda item: (item[2], -item[1], item[0]))
         for index, (pos, delta, expansion_level) in enumerate(sorted_rows, start=1):
             current_start, current_end = expansion_window_end(window, expansion_level, expansion_step_bp)
             candidates.append(
                 Candidate(
-                    side=side,
+                    side=window.side,
                     chrom=window.chrom,
                     pos=pos,
                     delta_snp_index=delta,
@@ -289,7 +314,10 @@ def main() -> int:
         raise FileNotFoundError(f"snpindex 文件不存在: {snpindex_path}")
 
     chrom, start_bp, end_bp = parse_region(args.region)
-    windows = build_windows(chrom, start_bp, end_bp)
+    if args.selection_mode == "bin":
+        windows = build_bin_windows(chrom, start_bp, end_bp, args.bin_size_bp)
+    else:
+        windows = build_windows(chrom, start_bp, end_bp)
     candidates = collect_candidates(snpindex_path, windows, args.expansion_step_bp)
 
     output_candidates = Path(args.output_candidates)

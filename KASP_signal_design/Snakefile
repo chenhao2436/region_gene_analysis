@@ -8,6 +8,7 @@ SCRIPT_DIR = Path("scripts")
 TEMP_DIR = Path("temp")
 RESULTS_DIR = Path("results")
 RULE_ENV = "data/kasp_rule_env.yaml"
+REGIONS_FILE = config.get("regions_file", "data/regions.tsv")
 
 
 def load_regions(path: str) -> dict[str, str]:
@@ -25,7 +26,7 @@ def load_regions(path: str) -> dict[str, str]:
     return regions
 
 
-REGIONS = load_regions("data/regions.tsv")
+REGIONS = load_regions(REGIONS_FILE)
 REGION_IDS = list(REGIONS.keys())
 
 
@@ -48,6 +49,8 @@ rule rank_candidates:
         region=region_value,
         rank_limit=lambda wildcards: config["initial_rank_limit"],
         expansion_step=lambda wildcards: config["expansion_step_bp"],
+        selection_mode=lambda wildcards: config.get("selection_mode", "flank"),
+        bin_size=lambda wildcards: config.get("bin_size_bp", 1000000),
         log_dir=lambda wildcards: f"temp/{wildcards.region_id}"
     log:
         "temp/{region_id}/01_rank_candidates.log"
@@ -63,6 +66,8 @@ rule rank_candidates:
           --output-summary "{output.summary}" \
           --initial-rank-limit "{params.rank_limit}" \
           --expansion-step-bp "{params.expansion_step}" \
+          --selection-mode "{params.selection_mode}" \
+          --bin-size-bp "{params.bin_size}" \
           > "{log}" 2>&1
         """
 
