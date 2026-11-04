@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local configuration
+.venv/
+venv/
+.env
+.env.*
+
+# Runtime outputs and temporary files
+*.log
+*.tmp
+*.swp
+.DS_Store
+.ipynb_checkpoints/
